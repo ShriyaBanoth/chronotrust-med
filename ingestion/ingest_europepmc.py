@@ -1,21 +1,25 @@
 """
 ChronoTrust-Med — Week 2b: ingest Cochrane systematic reviews from Europe PMC.
 
-epfl-llm/guidelines has no publication dates at all, which blocks the
-temporal-filtering baseline (B3). Europe PMC's REST API is free, needs no
-API key, and every record has a real publication date — so this replaces
-that corpus with Cochrane Database of Systematic Reviews records instead.
+Europe PMC provides publication dates needed for temporal filtering (B3).
 
-Matches the schema/insert style of ingest_with_content.py:
-  sources(title, source_type, journal, publication_date, url, reliability_score) -> source_id
-  passages(source_id, chunk_index, chunk_text, embedding)
+This script:
+1. Fetches Cochrane systematic reviews from Europe PMC.
+2. Skips records that are already present in the database.
+3. Inserts genuinely new sources.
+4. Chunks abstracts.
+5. Generates embeddings.
+6. Stores passages in PostgreSQL.
 
-This ADDS to whatever is already in `sources`/`passages` — it does not
-TRUNCATE. Run ingest_with_content.py first (or not at all) as you prefer.
+It does NOT TRUNCATE existing sources or passages.
 
 Run:
+
     pip install requests sentence-transformers psycopg2-binary
-    python ingestion/ingest_europepmc.py --db-url postgresql://user@localhost/chronotrust --limit 300
+
+    python ingestion/ingest_europepmc.py \
+        --db-url postgresql://localhost/chronotrust \
+        --limit 1
 """
 
 import argparse
@@ -25,28 +29,60 @@ import psycopg2
 import requests
 from sentence_transformers import SentenceTransformer
 
-EUROPEPMC_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+EUROPEPMC_BASE = (
+    "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+)
+
 QUERY = 'JOURNAL:"Cochrane Database Syst Rev" AND HAS_ABSTRACT:Y'
+
 PAGE_SIZE = 100
 
 CHUNK_WORDS = 250
 CHUNK_OVERLAP = 50
 
+JOURNAL_NAME = "Cochrane Database of Systematic Reviews"
 
-def chunk_text(text, chunk_words=CHUNK_WORDS, overlap=CHUNK_OVERLAP):
+
+# ============================================================
+# TEXT CHUNKING
+# ============================================================
+
+def chunk_text(
+    text,
+    chunk_words=CHUNK_WORDS,
+    overlap=CHUNK_OVERLAP,
+):
     words = text.split()
+
     if not words:
         return []
+
     chunks = []
     start = 0
+
     while start < len(words):
         end = start + chunk_words
-        chunks.append(" ".join(words[start:end]))
+
+        chunks.append(
+            " ".join(words[start:end])
+        )
+
         if end >= len(words):
             break
+
         start = end - overlap
+
     return chunks
 
+
+# ============================================================
+# EUROPE PMC API
+# ============================================================
 
 def fetch_page(cursor_mark):
     params = {
@@ -54,106 +90,464 @@ def fetch_page(cursor_mark):
         "format": "json",
         "pageSize": PAGE_SIZE,
         "cursorMark": cursor_mark,
-        "resultType": "core",  # needed to get abstractText
+        "resultType": "core",
     }
-    resp = requests.get(EUROPEPMC_BASE, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
 
+    response = requests.get(
+        EUROPEPMC_BASE,
+        params=params,
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ============================================================
+# DUPLICATE CHECK
+# ============================================================
+
+def source_already_exists(
+    cur,
+    doi,
+    title,
+    pub_date,
+):
+    """
+    Check whether this Europe PMC source already exists.
+
+    Primary identifier:
+        DOI
+
+    Fallback when DOI is unavailable:
+        title + publication_date + journal
+    """
+
+    # --------------------------------------------------------
+    # Preferred: DOI
+    # --------------------------------------------------------
+
+    if doi:
+        cur.execute(
+            """
+            SELECT source_id
+            FROM sources
+            WHERE doi = %s
+            LIMIT 1
+            """,
+            (doi,),
+        )
+
+    # --------------------------------------------------------
+    # Fallback: title + date + journal
+    # --------------------------------------------------------
+
+    else:
+        cur.execute(
+            """
+            SELECT source_id
+            FROM sources
+            WHERE title = %s
+              AND publication_date = %s
+              AND journal = %s
+            LIMIT 1
+            """,
+            (
+                title[:500],
+                pub_date,
+                JOURNAL_NAME,
+            ),
+        )
+
+    return cur.fetchone()
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db-url", required=True)
-    parser.add_argument("--limit", type=int, default=300, help="total records to ingest")
+
+    parser.add_argument(
+        "--db-url",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=300,
+        help="Maximum number of NEW sources to ingest",
+    )
+
     args = parser.parse_args()
 
-    print("Loading embedding model (all-MiniLM-L6-v2, local) ...")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    # --------------------------------------------------------
+    # Load embedding model
+    # --------------------------------------------------------
 
-    conn = psycopg2.connect(args.db_url)
+    print(
+        "Loading embedding model "
+        "(all-MiniLM-L6-v2, local) ..."
+    )
+
+    model = SentenceTransformer(
+        "all-MiniLM-L6-v2"
+    )
+
+    # --------------------------------------------------------
+    # Database
+    # --------------------------------------------------------
+
+    conn = psycopg2.connect(
+        args.db_url
+    )
+
     cur = conn.cursor()
+
+    # --------------------------------------------------------
+    # Counters
+    # --------------------------------------------------------
 
     sources_inserted = 0
     passages_inserted = 0
+
+    skipped_existing = 0
     skipped_no_abstract = 0
     skipped_no_date = 0
+
+    # --------------------------------------------------------
+    # Europe PMC cursor
+    # --------------------------------------------------------
+
     cursor_mark = "*"
 
-    print(f"Querying Europe PMC: {QUERY!r}")
+    print(
+        f"Querying Europe PMC: {QUERY!r}"
+    )
+
+    # ========================================================
+    # FETCH PAGES
+    # ========================================================
 
     while sources_inserted < args.limit:
+
         data = fetch_page(cursor_mark)
-        results = data.get("resultList", {}).get("result", [])
+
+        results = (
+            data
+            .get("resultList", {})
+            .get("result", [])
+        )
+
         if not results:
-            print("No more results from Europe PMC.")
+            print(
+                "No more results from Europe PMC."
+            )
             break
 
+        # ====================================================
+        # PROCESS EACH RECORD
+        # ====================================================
+
         for row in results:
+
             if sources_inserted >= args.limit:
                 break
 
-            abstract = row.get("abstractText")
+            # ------------------------------------------------
+            # Abstract
+            # ------------------------------------------------
+
+            abstract = row.get(
+                "abstractText"
+            )
+
             if not abstract:
                 skipped_no_abstract += 1
                 continue
 
-            # Prefer the full first-publication date; fall back to pubYear-01-01.
-            pub_date = row.get("firstPublicationDate")
+            # ------------------------------------------------
+            # Publication date
+            # ------------------------------------------------
+
+            pub_date = row.get(
+                "firstPublicationDate"
+            )
+
             if not pub_date:
-                pub_year = row.get("pubYear")
+
+                pub_year = row.get(
+                    "pubYear"
+                )
+
                 if not pub_year:
                     skipped_no_date += 1
                     continue
+
                 pub_date = f"{pub_year}-01-01"
 
-            title = row.get("title") or "(untitled)"
+            # ------------------------------------------------
+            # Basic metadata
+            # ------------------------------------------------
+
+            title = (
+                row.get("title")
+                or "(untitled)"
+            )
+
             doi = row.get("doi")
-            url = f"https://doi.org/{doi}" if doi else row.get("fullTextUrlList", {}).get("fullTextUrl", [{}])[0].get("url")
+
+            # ------------------------------------------------
+            # URL
+            # ------------------------------------------------
+
+            if doi:
+
+                url = (
+                    f"https://doi.org/{doi}"
+                )
+
+            else:
+
+                full_text_urls = (
+                    row
+                    .get("fullTextUrlList", {})
+                    .get("fullTextUrl", [])
+                )
+
+                if full_text_urls:
+                    url = full_text_urls[0].get(
+                        "url"
+                    )
+                else:
+                    url = None
+
+            # =================================================
+            # DUPLICATE CHECK
+            # =================================================
+
+            existing_source = source_already_exists(
+                cur=cur,
+                doi=doi,
+                title=title,
+                pub_date=pub_date,
+            )
+
+            if existing_source:
+
+                skipped_existing += 1
+
+                print(
+                    f"  [skip] Already exists: "
+                    f"source_id={existing_source[0]} | "
+                    f"{title[:70]}"
+                )
+
+                continue
+
+            # =================================================
+            # INSERT NEW SOURCE
+            # =================================================
 
             cur.execute(
                 """
-                INSERT INTO sources (title, source_type, journal, publication_date, url, reliability_score)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO sources
+                (
+                    title,
+                    source_type,
+                    journal,
+                    publication_date,
+                    doi,
+                    url,
+                    reliability_score
+                )
+                VALUES
+                (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
                 RETURNING source_id
                 """,
-                (title[:500], "systematic_review", "Cochrane Database of Systematic Reviews", pub_date, url, 0.9),
+                (
+                    title[:500],
+                    "systematic_review",
+                    JOURNAL_NAME,
+                    pub_date,
+                    doi,
+                    url,
+                    0.9,
+                ),
             )
+
             source_id = cur.fetchone()[0]
+
             sources_inserted += 1
 
-            chunks = chunk_text(abstract)
+            print(
+                f"  [new] source_id={source_id} | "
+                f"{title[:70]}"
+            )
+
+            # =================================================
+            # CHUNK ABSTRACT
+            # =================================================
+
+            chunks = chunk_text(
+                abstract
+            )
+
             if not chunks:
                 continue
-            embeddings = model.encode(chunks, show_progress_bar=False)
 
-            for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+            # =================================================
+            # EMBEDDINGS
+            # =================================================
+
+            embeddings = model.encode(
+                chunks,
+                show_progress_bar=False,
+            )
+
+            # =================================================
+            # INSERT PASSAGES
+            # =================================================
+
+            for i, (chunk, embedding) in enumerate(
+                zip(chunks, embeddings)
+            ):
+
                 cur.execute(
                     """
-                    INSERT INTO passages (source_id, chunk_index, chunk_text, embedding)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO passages
+                    (
+                        source_id,
+                        chunk_index,
+                        chunk_text,
+                        embedding
+                    )
+                    VALUES
+                    (
+                        %s,
+                        %s,
+                        %s,
+                        %s
+                    )
                     """,
-                    (source_id, i, chunk, emb.tolist()),
+                    (
+                        source_id,
+                        i,
+                        chunk,
+                        embedding.tolist(),
+                    ),
                 )
+
                 passages_inserted += 1
 
-            if sources_inserted % 50 == 0:
-                conn.commit()
-                print(f"  ... {sources_inserted} sources / {passages_inserted} passages so far")
+            # ------------------------------------------------
+            # Commit every 50 NEW sources
+            # ------------------------------------------------
 
-        next_cursor = data.get("nextCursorMark")
-        if not next_cursor or next_cursor == cursor_mark:
-            print("Reached end of result set.")
+            if sources_inserted % 50 == 0:
+
+                conn.commit()
+
+                print(
+                    f"  ... "
+                    f"{sources_inserted} new sources / "
+                    f"{passages_inserted} passages so far"
+                )
+
+        # ====================================================
+        # NEXT EUROPE PMC PAGE
+        # ====================================================
+
+        next_cursor = data.get(
+            "nextCursorMark"
+        )
+
+        if (
+            not next_cursor
+            or next_cursor == cursor_mark
+        ):
+
+            print(
+                "Reached end of result set."
+            )
+
             break
+
         cursor_mark = next_cursor
-        time.sleep(0.34)  # be polite to the free API (~3 req/sec)
+
+        # Europe PMC free API courtesy delay
+        time.sleep(0.34)
+
+    # ========================================================
+    # FINAL COMMIT
+    # ========================================================
 
     conn.commit()
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
+
     cur.close()
     conn.close()
 
-    print(f"\nDone. Inserted {sources_inserted} sources and {passages_inserted} passages.")
-    print(f"Skipped (no abstract): {skipped_no_abstract}, skipped (no date): {skipped_no_date}")
+    # ========================================================
+    # SUMMARY
+    # ========================================================
 
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "EUROPE PMC INGESTION COMPLETE"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print(
+        f"New sources inserted: {sources_inserted}"
+    )
+
+    print(
+        f"Passages inserted: {passages_inserted}"
+    )
+
+    print(
+        f"Existing sources skipped: {skipped_existing}"
+    )
+
+    print(
+        f"Skipped (no abstract): {skipped_no_abstract}"
+    )
+
+    print(
+        f"Skipped (no date): {skipped_no_date}"
+    )
+
+    print(
+        "========================================"
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
+    

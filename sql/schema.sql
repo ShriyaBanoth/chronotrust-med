@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS sources (
     reliability_score   NUMERIC(4,3),       -- 0.000-1.000, heuristic weight used in provenance ranking
     superseded_by        INTEGER REFERENCES sources(source_id),  -- self-reference: later edition of the same guideline
     created_at          TIMESTAMPTZ DEFAULT now()
+    claim_extraction_status TEXT NOT NULL DEFAULT 'pending'
 );
 
 CREATE TABLE IF NOT EXISTS medical_claims (
